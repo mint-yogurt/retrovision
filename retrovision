@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""retrovision: run a video or picture through NTSC, the way it would reach a 1980s/90s TV.
+
+    retrovision IN OUT [--deliver hdmi|dvd] [--motion broadcast|hold] [--decoder comb2|...]
+
+A post effect: the output runs exactly as long as the input and the sound is passed through untouched.
+ffmpeg decodes the source and times it to 59.94 fields a second, bin/rvntsc encodes and decodes
+every field as a composite signal, and ffmpeg encodes the result:
+
+  --deliver hdmi  (default) 640x480 at 59.94p, one frame per field, H.264 .mp4. For a PC feeding a
+                  CRT through an HDMI-to-AV converter: the converter makes the real fields itself.
+                  Play fullscreen with mpv at a 59.94/60 Hz desktop (--video-sync=display-resample).
+  --deliver dvd   720x480 29.97i, top field first, interlaced MPEG-2 (.mpg). True woven fields for DVD
+                  authoring or analogue hardware later.
+
+Motion (how the 59.94 field instants are filled from the source):
+  broadcast  (default) every field is its own moment in time, motion-interpolated: the fluid,
+             blurred motion of interlaced broadcast video. Slow (ffmpeg minterpolate, CPU).
+  hold       each field shows the nearest source frame. Fast; keeps the source's own motion.
+
+A still picture as IN (png/jpg/...) gives a still OUT (png) of one field as it looks on screen.
+"""
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from fractions import Fraction
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+RVNTSC = ROOT / "bin" / "rvntsc"
+CORE_W, H = 764, 480        # rvntsc's picture: 720 Rec. 601 pixels' worth of 4fsc samples
+PIC_W, PIC_X = 747, 8       # the 4:3 picture inside it
+FIELDS = "60000/1001"
+STILL_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".ppm"}
+
+
+def probe(path):
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                          "stream=codec_type,codec_name,width,height,sample_aspect_ratio,avg_frame_rate,"
+                          "r_frame_rate,color_space,duration",
+                          "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+    streams = json.loads(out)["streams"]
+    video = next(s for s in streams if s["codec_type"] == "video")
+    audio = next((s["codec_name"] for s in streams if s["codec_type"] == "audio"), None)
+    return video, audio
+
+
+def rate(s):
+    try:
+        r = Fraction(s)
+        return float(r) if r > 0 else None
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def picture_filter(video, fit):
+    """Scale the source onto the 4:3 picture in rvntsc's 764 x 480 sample grid."""
+    w, h = int(video["width"]), int(video["height"])
+    sar_s = video.get("sample_aspect_ratio") or "1:1"
+    sar = Fraction(1) if sar_s in ("0:1", "N/A") else Fraction(sar_s.replace(":", "/"))
+    dar = Fraction(w, h) * sar
+    four3 = Fraction(4, 3)
+    pre = ""
+    pw, ph = PIC_W, H
+    if dar > four3 * Fraction(101, 100):
+        if fit == "crop":
+            pre = f"crop={round(h * four3 / sar)}:{h},"
+        else:
+            ph = round(H * four3 / dar / 2) * 2
+    elif dar < four3 * Fraction(99, 100):
+        if fit == "crop":
+            pre = f"crop={w}:{round(w * sar / four3)},"
+        else:
+            pw = round(PIC_W * dar / four3)
+    x = (CORE_W - pw) // 2 if pw != PIC_W else PIC_X
+    y = (H - ph) // 2
+    return (f"{pre}scale={pw}:{ph}:flags=lanczos:in_color_matrix={source_matrix(video)},setsar=1,"
+            f"pad={CORE_W}:{H}:{x}:{y}:black")
+
+
+def source_matrix(video):
+    """The source's YUV matrix: its tag, or, untagged, what players assume (BT.709 above 576 lines)."""
+    tag = video.get("color_space", "")
+    if tag in ("bt709",):
+        return "bt709"
+    if tag in ("smpte170m", "bt470bg"):
+        return "bt601"
+    return "bt709" if int(video["height"]) > 576 else "bt601"
+
+
+def motion_filter(mode):
+    """Filters that time the source to 59.94 field instants. Never changes the running time."""
+    if mode == "broadcast":
+        return f"minterpolate=fps={FIELDS}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+    return f"fps={FIELDS}"  # hold: each field shows the nearest source frame
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input")
+    ap.add_argument("output")
+    ap.add_argument("--deliver", choices=("hdmi", "dvd"), default="hdmi")
+    ap.add_argument("--motion", choices=("broadcast", "hold"), default="broadcast")
+    ap.add_argument("--decoder", choices=("notch", "comb1", "comb2", "svideo"), default="comb2")
+    ap.add_argument("--fit", choices=("pad", "crop"), default="pad",
+                    help="non-4:3 sources: letterbox/pillarbox (pad) or centre-cut (crop)")
+    ap.add_argument("--ntsc", action="append", default=[], metavar="KEY=VALUE",
+                    help="any other rvntsc option, e.g. --ntsc sharpness=0.5 (repeatable)")
+    ap.add_argument("--seconds", type=float, help="only process this much of the input")
+    ap.add_argument("--crf", type=int, default=12, help="H.264 quality for --deliver hdmi")
+    args = ap.parse_args()
+
+    if not RVNTSC.exists():
+        sys.exit(f"retrovision: {RVNTSC} is missing; run make in {ROOT}")
+    if not shutil.which("ffmpeg"):
+        sys.exit("retrovision: ffmpeg is not installed")
+    src = Path(args.input)
+    video, acodec = probe(src)
+    still = src.suffix.lower() in STILL_EXT
+    core = [str(RVNTSC), f"--decoder={args.decoder}", *("--" + o for o in args.ntsc)]
+
+    if still:
+        # eight identical fields so the colour lock settles, keep the last
+        dec = ["ffmpeg", "-v", "error", "-loop", "1", "-i", str(src), "-frames:v", "8",
+               "-vf", picture_filter(video, args.fit) + ",format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+        enc = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CORE_W}x{H}",
+               "-i", "-", "-vf", f"select=eq(n\\,7),crop={PIC_W}:{H}:{PIC_X}:0,scale=640:{H}:flags=lanczos",
+               "-frames:v", "1", str(args.output)]
+        core.append("--out=fields")
+        return pipeline(dec, core, enc)
+
+    fps = rate(video.get("avg_frame_rate")) or rate(video.get("r_frame_rate"))
+    length = float(video.get("duration") or 0)
+    if args.seconds:
+        length = min(length, args.seconds) if length else args.seconds
+    # the last frame is held for its own duration, so the picture runs exactly as long as the source
+    vmotion = ("tpad=stop_mode=clone:stop=2," if length else "") + motion_filter(args.motion) + \
+        (f",trim=duration={length:.6f}" if length else "")
+    limit = ["-t", str(args.seconds)] if args.seconds else []
+    dec = ["ffmpeg", "-v", "error", *limit, "-i", str(src), "-an",
+           "-vf", f"{picture_filter(video, args.fit)},{vmotion},format=rgb24",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    raw_in = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CORE_W}x{H}"]
+    # a post effect: the sound is passed through untouched (re-encoded only if the container can't take it)
+    audio_in = [*limit, "-i", str(src)] if acodec else []
+    amap = ["-map", "1:a:0"] if acodec else []
+    tags = ["-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m"]
+
+    if args.deliver == "hdmi":
+        core.append("--out=fields")
+        enc = ["ffmpeg", "-v", "error", "-y", *raw_in, "-r", FIELDS, "-i", "-", *audio_in, "-map", "0:v", *amap,
+               "-vf", f"crop={PIC_W}:{H}:{PIC_X}:0,scale=640:{H}:flags=lanczos:out_color_matrix=bt601:out_range=tv,"
+                      "format=yuv420p",
+               "-c:v", "libx264", "-preset", "slow", "-crf", str(args.crf), *tags,
+               "-c:a", "copy" if acodec in ("aac", "mp3", "ac3", "eac3", "alac", "opus") else "aac",
+               "-b:a", "256k", "-movflags", "+faststart", str(args.output)]
+    else:
+        core.append("--out=weave")
+        enc = ["ffmpeg", "-v", "error", "-y", *raw_in, "-r", "30000/1001", "-i", "-", *audio_in, "-map", "0:v", *amap,
+               "-vf", f"crop={PIC_W}:{H}:{PIC_X}:0,"
+                      f"scale=704:{H}:flags=lanczos:interl=1:out_color_matrix=bt601:out_range=tv,"
+                      "pad=720:480:8:0,format=yuv420p,setfield=tff",
+               "-c:v", "mpeg2video", "-b:v", "8000k", "-maxrate", "9000k", "-bufsize", "1835k",
+               "-flags", "+ilme+ildct", "-top", "1", "-aspect", "4:3", *tags,
+               *(["-c:a", "copy"] if acodec == "ac3" else ["-c:a", "ac3", "-b:a", "256k"]), "-f", "dvd", str(args.output)]
+    print(f"retrovision: {src.name} at {fps or '?'} fps, motion {args.motion}, decoder {args.decoder}, "
+          f"deliver {args.deliver}", file=sys.stderr)
+    return pipeline(dec, core, enc)
+
+
+def pipeline(dec, core, enc):
+    """ffmpeg | rvntsc | ffmpeg, joined by OS pipes."""
+    p1 = subprocess.Popen(dec, stdout=subprocess.PIPE)
+    p2 = subprocess.Popen([*core, "--stats"], stdin=p1.stdout, stdout=subprocess.PIPE)
+    p1.stdout.close()
+    p3 = subprocess.Popen(enc, stdin=p2.stdout)
+    p2.stdout.close()
+    codes = [p3.wait(), p2.wait(), p1.wait()]
+    if any(codes):
+        sys.exit(f"retrovision: a stage failed (encode, rvntsc, decode exit codes {codes})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
